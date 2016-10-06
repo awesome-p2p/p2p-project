@@ -12,7 +12,12 @@ import time
 import traceback
 import warnings
 
-from .base import (flags, compression, to_base_58, from_base_58, protocol,
+try:
+    from .cbase import protocol
+except:
+    from .base import protocol
+
+from .base import (flags, compression, to_base_58, from_base_58,
                 base_connection, message, base_daemon, base_socket,
                 pathfinding_message, json_compressions)
 from .utils import (getUTC, get_socket, intersect, file_dict,
@@ -53,16 +58,17 @@ class chord_connection(base_connection):
     def __hash__(self):
         return self.id_10 or id(self)
 
-class chord_daemon(base_daemon): 
+class chord_daemon(base_daemon):
     def mainloop(self):
         while self.main_thread.is_alive() and self.alive:
             conns = list(self.server.routing_table.values()) + self.server.awaiting_ids
-            if conns:
-                for handler in select.select(conns, [], [], 0.01)[0]:
+            for handler in select.select(conns + [self.sock], [], [], 0.01)[0]:
+                if handler == self.sock:
+                    self.handle_accept()
+                else:
                     self.process_data(handler)
-                for handler in conns:
-                    self.kill_old_nodes(handler)
-            self.handle_accept()
+            for handler in conns:
+                self.kill_old_nodes(handler)
             self.server.update_fingers()
 
     def handle_accept(self):
@@ -155,10 +161,20 @@ class chord_socket(base_socket):
                 if former not in self.routing_table.values():
                     self.disconnect(former)
 
+    def is_saturated(self):
+        for x in xrange(self.k):
+            node = self.__findFinger__(self.id_10 + 2**x % self.limit)
+            if distance(node.id_10, self.id_10 + 2**x, self.limit) != 0:
+                return False
+        return True
+
     def update_fingers(self):
+        should_request = (not (getUTC() % 5)) and (not self.is_saturated())
         for handler in list(self.routing_table.values()) + self.awaiting_ids + self.predecessors:
             if handler.id:
                 self.set_fingers(handler)
+            if should_request:
+                handler.send(flags.whisper, flags.request, b'*')
 
     def handle_msg(self, msg, conn):
         """Decides how to handle various message types, allowing some to be handled automatically"""
@@ -201,10 +217,10 @@ class chord_socket(base_socket):
                     if distance(self.__findFinger__(goal).id_10, goal, self.limit) \
                             > distance(key, goal, self.limit):
                         self.__connect(*addr)
-                if distance(self.id_10, self.next.id_10, self.limit) \
+                if distance(self.id_10, self.next.id_10-1, self.limit) \
                     > distance(self.id_10, key, self.limit):
                     self.__connect(*addr)
-                if distance(self.prev.id_10, self.id_10, self.limit) \
+                if distance(self.prev.id_10+1, self.id_10, self.limit) \
                     > distance(key, self.id_10, self.limit):
                     self.__connect(*addr)
             return True
@@ -289,6 +305,7 @@ class chord_socket(base_socket):
             self.__send_handshake__(handler)
 
     def join(self):
+        # for handler in self.awaiting_ids:
         handler = random.choice(self.awaiting_ids)
         self.__send_handshake__(handler)
 
@@ -316,6 +333,7 @@ class chord_socket(base_socket):
         while common == -1:
             time.sleep(1)
             print('loop')
+            print(vals)
             common = most_common(vals)
         if common is not None and vals.count(common) > len(hashes) // 2:
             return common

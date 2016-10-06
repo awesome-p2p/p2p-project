@@ -11,17 +11,34 @@ import sys
 import traceback
 
 from collections import deque
+
+try:
+    from .cbase import protocol
+except:
+    from .base import protocol
 from .base import (flags, compression, to_base_58, from_base_58,
-                protocol, base_connection, message, base_daemon,
-                base_socket, pathfinding_message, json_compressions)
+                base_connection, message, base_daemon, base_socket,
+                pathfinding_message, json_compressions)
 from .utils import getUTC, get_socket, intersect
 
 max_outgoing = 4
 default_protocol = protocol('mesh', "Plaintext")  # SSL")
 
 class mesh_connection(base_connection):
+    """The class for mesh connection abstraction. This inherits from :py:class:`py2p.base.base_connection`"""
     def send(self, msg_type, *args, **kargs):
-        """Sends a message through its connection. The first argument is message type. All after that are content packets"""
+        """Sends a message through its connection.
+
+        Args:
+            msg_type:   Message type, corresponds to the header in a :py:class:`py2p.base.pathfinding_message` object
+            *args:      A list of bytes-like objects, which correspond to the packets to send to you
+            **kargs:    There are two available keywords:
+            id:         The ID this message should appear to be sent from (default: your ID)
+            time:       The time this message should appear to be sent from (default: now in UTC)
+
+        Returns:
+            the :py:class:`~py2p.base.pathfinding_message` object you just sent, or None if the sending was unsuccessful
+        """
         msg = super(mesh_connection, self).send(msg_type, *args, **kargs)
         if msg and (msg.id, msg.time) not in self.server.waterfalls:
             self.server.waterfalls.appendleft((msg.id, msg.time))
@@ -31,8 +48,8 @@ class mesh_connection(base_connection):
         try:
             msg = super(mesh_connection, self).found_terminator()
         except (IndexError, struct.error):
-            self.__print__("Failed to decode message: %s. Expected compression: %s." % \
-                            (raw_msg, intersect(compression, self.compression)[0]), level=1)
+            self.__print__("Failed to decode message. Expected first compression of: %s." % \
+                            intersect(compression, self.compression), level=1)
             self.send(flags.renegotiate, flags.compression, json.dumps([]))
             self.send(flags.renegotiate, flags.resend)
             return
@@ -45,6 +62,21 @@ class mesh_connection(base_connection):
         self.server.handle_msg(message(msg, self.server), self)
 
     def handle_waterfall(self, msg, packets):
+        """This method determines whether this message has been previously received or not.
+
+        If it has been previously received, this method returns ``True``.
+
+        If it is older than a preset limit, this method returns ``True``.
+
+        Otherwise this method returns ``None``, and forwards the message appropriately.
+
+        Args:
+            msg:        The message in question
+            packets:    The message's packets
+
+        Returns:
+            Either ``True`` or ``None``
+        """
         if packets[0] in [flags.waterfall, flags.broadcast]:
             if from_base_58(packets[3]) < getUTC() - 60:
                 self.__print__("Waterfall expired", level=2)
@@ -60,12 +92,13 @@ class mesh_daemon(base_daemon):
         """Daemon thread which handles all incoming data and connections"""
         while self.main_thread.is_alive() and self.alive:
             conns = list(self.server.routing_table.values()) + self.server.awaiting_ids
-            if conns:
-                for handler in select.select(conns, [], [], 0.01)[0]:
+            for handler in select.select(conns + [self.sock], [], [], 0.01)[0]:
+                if handler == self.sock:
+                    self.handle_accept()
+                else:
                     self.process_data(handler)
-                for handler in conns:
-                    self.kill_old_nodes(handler)
-            self.handle_accept()
+            for handler in conns:
+                self.kill_old_nodes(handler)
 
     def handle_accept(self):
         """Handle an incoming connection"""
@@ -159,12 +192,27 @@ class mesh_socket(base_socket):
         self.routing_table.update({h_id: to_keep})
 
     def __handle_handshake(self, msg, handler):
+        """This callback is used to deal with handshake signals. Its three primary jobs are:
+
+             - reject connections seeking a different network
+             - set connection state
+             - deal with connection conflicts
+
+             Args:
+                msg:        A :py:class:`~py2p.base.message`
+                handler:    A :py:class:`~py2p.mesh.mesh_connection`
+
+             Returns:
+                Either ``True`` or ``None``
+        """
         packets = msg.packets
         if packets[0] == flags.handshake:
             if packets[2] != self.protocol.id:
+                self.__print__("Connected to peer on wrong subnet. ID: %s" % packets[2], level=2)
                 self.disconnect(handler)
                 return True
             elif handler is not self.routing_table.get(packets[1], handler):
+                self.__print__("Connection conflict detected. Trying to resolve", level=2)
                 self.__resolve_connection_conflict(handler, packets[1])
             handler.id = packets[1]
             handler.addr = json.loads(packets[3].decode())
@@ -178,6 +226,15 @@ class mesh_socket(base_socket):
             return True
 
     def __handle_peers(self, msg, handler):
+        """This callback is used to deal with peer signals. Its primary jobs is to connect to the given peers, if this does not exceed :py:const:`py2p.mesh.max_outgoing`
+
+             Args:
+                msg:        A :py:class:`~py2p.base.message`
+                handler:    A :py:class:`~py2p.mesh.mesh_connection`
+
+             Returns:
+                Either ``True`` or ``None``
+        """
         packets = msg.packets
         if packets[0] == flags.peers:
             new_peers = json.loads(packets[1].decode())
@@ -186,11 +243,23 @@ class mesh_socket(base_socket):
                     try:
                         self.connect(addr[0], addr[1], id.encode())
                     except:  # pragma: no cover
-                        self.__print__("Could not connect to %s:%s because\n%s" % (addr[0], addr[1], traceback.format_exc()), level=1)
+                        self.__print__("Could not connect to %s because\n%s" % (addr, traceback.format_exc()), level=1)
                         continue
             return True
 
     def __handle_response(self, msg, handler):
+        """This callback is used to deal with response signals. Its two primary jobs are:
+
+             - if it was your request, send the deferred message
+             - if it was someone else's request, relay the information
+
+             Args:
+                msg:        A :py:class:`~py2p.base.message`
+                handler:    A :py:class:`~py2p.mesh.mesh_connection`
+
+             Returns:
+                Either ``True`` or ``None``
+        """
         packets = msg.packets
         if packets[0] == flags.response:
             self.__print__("Response received for request id %s" % packets[1], level=1)
@@ -204,6 +273,19 @@ class mesh_socket(base_socket):
             return True
 
     def __handle_request(self, msg, handler):
+        """This callback is used to deal with request signals. Its three primary jobs are:
+
+             - respond with a peers signal if packets[1] is ``'*'``
+             - if you know the ID requested, respond to it
+             - if you don't, make a request with your peers
+
+             Args:
+                msg:        A :py:class:`~py2p.base.message`
+                handler:    A :py:class:`~py2p.mesh.mesh_connection`
+
+             Returns:
+                Either ``True`` or ``None``
+        """
         packets = msg.packets
         if packets[0] == flags.request:
             if packets[1] == b'*':
@@ -213,7 +295,20 @@ class mesh_socket(base_socket):
             return True
 
     def send(self, *args, **kargs):
-        """Sends data to all peers. type flag will override normal subflag. Defaults to 'broadcast'"""
+        """This sends a message to all of your peers. If you use default values it will send it to everyone on the network
+        *
+        Args:
+            *args:      A list of strings or bytes-like objects you want your peers to receive
+            **kargs:    There are two keywords available:
+            flag:       A string or bytes-like object which defines your flag. In other words, this defines packet 0.
+            type:       A string or bytes-like object which defines your message type. Changing this from default can have adverse effects.
+
+        Warning:
+
+            If you change the type attribute from default values, bad things could happen. It **MUST** be a value from :py:data:`py2p.base.flags` ,
+            and more specifically, it **MUST** be either ``broadcast`` or ``whisper``. The only other valid flags are ``waterfall`` and ``renegotiate``,
+            but these are **RESERVED** and must **NOT** be used.
+        """
         send_type = kargs.pop('type', flags.broadcast)
         main_flag = kargs.pop('flag', flags.broadcast)
         # map(methodcaller('send', 'broadcast', 'broadcast', *args), self.routing_table.values())
@@ -232,7 +327,7 @@ class mesh_socket(base_socket):
             self.waterfalls.appendleft((msg.id, msg.time))
             for handler in self.routing_table.values():
                 if handler.id != msg.sender:
-                    handler.send(flags.waterfall, *msg.packets, time=msg.time_58, id=msg.sender)
+                    handler.send(flags.waterfall, *msg.packets, time=msg.time, id=msg.sender)
             self.__clean_waterfalls()
             return True
         else:

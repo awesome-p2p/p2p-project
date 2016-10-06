@@ -5,8 +5,9 @@ import os
 import socket
 import ssl
 import sys
-import tempfile
 import uuid
+
+from tempfile import NamedTemporaryFile
 
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
@@ -21,6 +22,7 @@ if sys.version_info < (3, ):
     cleanup_files = []
 
     def cleanup():  # pragma: no cover
+        """Cleans SSL certificate and key files"""
         for f in cleanup_files:
             os.remove(f)
 
@@ -28,7 +30,12 @@ if sys.version_info < (3, ):
 
 
 def generate_self_signed_cert(cert_file, key_file):
-    """Given two file-like objects, generate an SSL key and certificate."""
+    """Given two file-like objects, generate an SSL key and certificate
+
+    Args:
+        cert_file:  The certificate file you wish to write to
+        key_file:   The key file you wish to write to
+    """
     one_day = datetime.timedelta(1, 0, 0)
     private_key = rsa.generate_private_key(
         public_exponent=65537,
@@ -44,7 +51,8 @@ def generate_self_signed_cert(cert_file, key_file):
         x509.NameAttribute(NameOID.COMMON_NAME, u'cryptography.io'),
     ]))
     builder = builder.not_valid_before(datetime.datetime.today() - one_day)
-    builder = builder.not_valid_after(datetime.datetime.today() + datetime.timedelta(365*10))
+    builder = builder.not_valid_after(datetime.datetime.today() +
+                                      datetime.timedelta(365*10))
     builder = builder.serial_number(int(uuid.uuid4()))
     builder = builder.public_key(public_key)
     builder = builder.add_extension(
@@ -56,7 +64,7 @@ def generate_self_signed_cert(cert_file, key_file):
     )
 
     key_file.write(private_key.private_bytes(
-        Encoding.PEM, 
+        Encoding.PEM,
         PrivateFormat.TraditionalOpenSSL,
         NoEncryption()
     ))
@@ -64,13 +72,23 @@ def generate_self_signed_cert(cert_file, key_file):
 
 
 def get_socket(server_side):
+    """Returns a socket set up as server or client side
+
+    Args:
+        server_side:    Whether the socket should be server side or not
+
+    Returns:
+        An SSL socket object
+    """
     if server_side:
         names = (None, None)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".cert") as cert_file:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".key") as key_file:
+        with NamedTemporaryFile(delete=False, suffix=".cert") as cert_file:
+            with NamedTemporaryFile(delete=False, suffix=".key") as key_file:
                 generate_self_signed_cert(cert_file, key_file)
                 names = (cert_file.name, key_file.name)
-        sock = ssl.wrap_socket(socket.socket(), suppress_ragged_eofs=True, server_side=True, keyfile=names[1], certfile=names[0])
+        sock = ssl.wrap_socket(socket.socket(), suppress_ragged_eofs=True,
+                               server_side=True, keyfile=names[1],
+                               certfile=names[0])
         if sys.version_info >= (3, ):
             os.remove(names[0])
             os.remove(names[1])
@@ -78,4 +96,5 @@ def get_socket(server_side):
             cleanup_files.extend(names)
         return sock
     else:
-        return ssl.wrap_socket(socket.socket(), server_side=False, suppress_ragged_eofs=True)
+        return ssl.wrap_socket(socket.socket(), server_side=False,
+                               suppress_ragged_eofs=True)
